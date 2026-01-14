@@ -81,6 +81,7 @@ def load_scenario_data(scenario_id: str, simulation_log: Dict) -> Dict:
         'tvec': data['tvec'],
         'metadata': simulation_log[scenario_id],
         'p_gen_scaled': data['p_gen_scaled'],
+        'q_gen_scaled': data['q_gen_scaled'],
         'p_load_scaled': data['p_load_scaled'],
         'q_load_scaled': data['q_load_scaled'],
     }
@@ -112,6 +113,16 @@ def get_state_timeseries_all(
     diverged: Optional[bool] = False
 ) -> Dict[str, Dict[str, Union[np.ndarray, Any]]]:
     """Extract a state variable from multiple scenarios with filtering."""
+
+    # Diverged scenarios
+    filtered_scenarios_div = filter_scenarios(
+        simulation_log, 
+        sample_idx,
+        fault_location,
+        fault_impedance,
+        diverged=True
+    )
+    
     # Filter scenarios
     filtered_scenarios = filter_scenarios(
         simulation_log, 
@@ -120,6 +131,11 @@ def get_state_timeseries_all(
         fault_impedance,
         diverged
     )
+
+    print(f"Scenarios that did not diverge: {len(filtered_scenarios)}; scenarios that diverged: {len(filtered_scenarios_div)}")
+
+    # I am not keeping this around
+    filtered_scenarios_div = None
     
     # Find state indices
     state_indices = find_state_index(
@@ -140,6 +156,7 @@ def get_state_timeseries_all(
     for scenario_id, scenario_info in filtered_scenarios.items():
         try:
             scenario_data = load_scenario_data(scenario_id, simulation_log)
+
             tvec, values = get_state_timeseries(scenario_data, state_idx)
             
             results[scenario_id] = {
@@ -236,9 +253,9 @@ def example_gen1_speed_deviation():
     
     return results
 
-def ComputeTSI():
+def ComputeTSI(simulation_log_path = 'simulation_log.json'):
     # Load metadata
-    simulation_log = load_simulation_log()
+    simulation_log = load_simulation_log(simulation_log_path)
     state_metadata = load_state_metadata()
     
     # 1) find all (device_number, bus_num) pairs for GenGENROU δ-states
@@ -275,6 +292,8 @@ def ComputeTSI():
     scenario_sets = [set(d.keys()) for d in delta_dicts.values()]
     common_scenarios = sorted(set.intersection(*scenario_sets))
     if not common_scenarios:
+        print("No scenario is common to all generators!")
+        return 0
         raise RuntimeError("No scenario is common to all generators!")
 
     print(f"Found {len(common_scenarios)} common scenarios")
@@ -290,6 +309,7 @@ def ComputeTSI():
     tsi_per_scenario = {}
     tsi_ts_per_scenario = {}
     pg_per_scenario = {}
+    qg_per_scenario = {}
     pl_per_scenario = {}
     ql_per_scenario = {}
 
@@ -303,6 +323,7 @@ def ComputeTSI():
         try:
             scenario_data = load_scenario_data(scenario_id, simulation_log)
             pg_per_scenario[scenario_id] = scenario_data['p_gen_scaled']
+            qg_per_scenario[scenario_id] = scenario_data['q_gen_scaled']
             pl_per_scenario[scenario_id] = scenario_data['p_load_scaled']
             ql_per_scenario[scenario_id] = scenario_data['q_load_scaled']
             del scenario_data  # Free immediately
@@ -337,15 +358,18 @@ def ComputeTSI():
     # Package results
     post_data = {}
     post_data['tsi_per_scenario'] = tsi_per_scenario
-    post_data['tsi_ts_per_scenario'] = tsi_ts_per_scenario
     post_data['tsi_all'] = tsi_all
+    post_data['tsi_ts_per_scenario'] = tsi_ts_per_scenario
     post_data['tsi_all_time'] = tsi_all_time
     post_data['pg_per_scenario'] = pg_per_scenario
+    post_data['qg_per_scenario'] = qg_per_scenario
     post_data['pl_per_scenario'] = pl_per_scenario
     post_data['ql_per_scenario'] = ql_per_scenario
 
     print(f'TSI for all scenarios: {tsi_all.shape}')
+    print(f"TSI per scenario", len(tsi_per_scenario))
     print(f'TSI for all time scenarios: {tsi_all_time.shape}')
+    # print(f'TSI ts per scenario (all cases - diverged and converged): {tsi_ts_per_scenario.shape}')
     
     # Plotting code (unchanged)
     try:
@@ -373,9 +397,61 @@ def ComputeTSI():
         
     return post_data
 
-def create_training_samples(post_data: Dict):
+# This code is assuming that the number of indices stays the same per fault
+def fault_location_by_matrix_index(post_data, simulation_log_path = 'simulation_log.json'):
+    simulation_log = load_simulation_log(simulation_log_path)
+
+    # Using a normal dict
+    fault_location_map = {}
+
+    for k, v in simulation_log.items():
+        floc = v["fault_location"]
+        if floc not in fault_location_map:
+            fault_location_map[floc] = []
+        fault_location_map[floc].append(k)
+
+    # build a mapping from uuid -> index
+    uuid_to_idx = {uuid: i for i, uuid in enumerate(post_data["tsi_per_scenario"])}
+
+    # Create dicturnary for the fault location and missing faults
+    floc_with_indices = {}
+    removed_uuids = {}  # store the missing ones here
+
+    for floc, uuids in fault_location_map.items():
+        indices = []
+        missing = []
+
+        for uid in uuids:
+            if uid in uuid_to_idx:
+                indices.append(uuid_to_idx[uid])
+            else:
+                missing.append(uid)
+
+        floc_with_indices[floc] = {
+            "indices": indices,
+        }
+
+        # That uuids removed in the process to calculate the TSI
+        if missing:  
+            removed_uuids[floc] = missing
+
+    # Filter out empty lists
+    nonempty = {k: v["indices"] for k, v in floc_with_indices.items() if v["indices"]}
+
+    # Stack into matrix
+    index_by_fault = np.vstack(list(nonempty.values()))
+    row_fault_location = np.array(list(nonempty.keys()), dtype=int)
+
+    return index_by_fault, row_fault_location, removed_uuids
+
+def create_training_samples(post_data: Dict, filename = None, simulation_log_path = 'simulation_log.json'):
+    tsi_all_time = post_data['tsi_ts_per_scenario']
     tsi_dict = post_data['tsi_per_scenario']
+    # tsi_dict = post_data['tsi_all']
+    # print(f"tsi_all_time", tsi_all_time)
+    # print(f"tsi_all_time first element's value", tsi_all_time[list(tsi_all_time.keys())[0]])
     pg_dict  = post_data['pg_per_scenario']
+    qg_dict  = post_data['qg_per_scenario']
     pl_dict  = post_data['pl_per_scenario']
     ql_dict  = post_data['ql_per_scenario']
 
@@ -383,31 +459,46 @@ def create_training_samples(post_data: Dict):
 
     first_sid = scenario_ids[0]
     pg_len = len(pg_dict[first_sid])
+    qg_len = len(qg_dict[first_sid])
     pl_len = len(pl_dict[first_sid])
     ql_len = len(ql_dict[first_sid])
 
-    col_name = (
+    col_name = (    
+
         [f'pg_{i+1}' for i in range(pg_len)] +
+        [f'qg_{i+1}' for i in range(qg_len)] +
         [f'pl_{i+1}' for i in range(pl_len)] +
         [f'ql_{i+1}' for i in range(ql_len)] +
-        ['tsi']
+        ['tsi'] +
+        [f'tsi_t{i+1}' for i in range(len(tsi_all_time[list(tsi_all_time.keys())[0]]))]
     )
 
     rows = []
     for sid in scenario_ids:
         pg = pg_dict[sid]
+        qg = qg_dict[sid]
         pl = pl_dict[sid]
         ql = ql_dict[sid]
         tsi = np.array([tsi_dict[sid]])
+        # print(f"tsi_all_time[sid]", tsi_all_time[sid])
+        tsi_ts = tsi_all_time[sid]
     
-        row = np.hstack((pg, pl, ql, tsi))
+        row = np.hstack((pg, qg, pl, ql, tsi, tsi_ts))
         rows.append(row)
 
     Data = np.vstack(rows)
 
+    index_by_fault, row_fault_location, removed_uuids = fault_location_by_matrix_index(post_data, simulation_log_path = 'simulation_log.json')
+
     # save to .mat file
-    print("Save samples to data_record.mat")
-    scio.savemat('data_record.mat', {'Data': Data, 'col_name': col_name})
+    if filename is None:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        print(f"./Save samples to IEEE9_{Data.shape[0]}_samples_{timestamp}.mat")
+        # scio.savemat(f'IEEE9_{Data.shape[0]}_samples_{timestamp}.mat', {'Data': Data, 'col_name': col_name, "fault_per_index"})
+        scio.savemat(f'IEEE9_{Data.shape[0]}_samples_{timestamp}.mat', {'Data': Data, 'col_name': col_name, "index_by_fault": index_by_fault, "row_fault_location": row_fault_location})
+    else:
+        print(f"{filename}.mat")
+        scio.savemat(f'{filename}.mat', {'Data': Data, 'col_name': col_name, "index_by_fault": index_by_fault, "row_fault_location": row_fault_location})
 
 if __name__ == "__main__":
     # (original) compute generator speeds (ω)
